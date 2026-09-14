@@ -35,7 +35,7 @@ use crate::proto::{
 use crate::r#async::connection::*;
 use crate::r#async::shutdown;
 use crate::r#async::stream::{
-    Kind, MessageReceiver, MessageSender, ResultReceiver, ResultSender, StreamInner,
+    result_channel, Kind, MessageReceiver, MessageSender, ResultSender, StreamInner,
 };
 use crate::r#async::utils;
 use crate::r#async::{MethodHandler, StreamHandler, TtrpcContext};
@@ -690,7 +690,7 @@ impl HandlerContext {
         let req = req_msg.payload;
         let path = utils::get_path(&req.service, &req.method);
 
-        let (tx, rx): (ResultSender, ResultReceiver) = channel(100);
+        let (tx, rx) = result_channel();
         let stream_tx = tx.clone();
         self.streams.lock().unwrap().insert(stream_id, tx);
 

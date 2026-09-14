@@ -23,10 +23,107 @@ use crate::proto::{
 pub type MessageSender = mpsc::Sender<SendingMessage>;
 pub type MessageReceiver = mpsc::Receiver<SendingMessage>;
 
-/// Internal message type for stream channels.
+/// Maximum number of inbound frames buffered for one stream.
+const MAX_QUEUED_FRAMES: usize = 100;
+
+const QUEUE_OVERFLOW: &str = "stream inbound queue capacity exceeded";
+const RECEIVER_GONE: &str = "the stream receiver is gone";
+
+#[derive(Debug, Default)]
+struct ResultChannelState {
+    /// Stored outside the bounded queue so an error can still be reported when
+    /// the queue itself is full. The receiver observes it after draining frames
+    /// that were accepted before the stream failed.
+    terminal_error: Option<Error>,
+}
+
+/// Creates the inbound mailbox of a single stream.
+pub fn result_channel() -> (ResultSender, ResultReceiver) {
+    let (tx, rx) = mpsc::channel(MAX_QUEUED_FRAMES);
+    let state = Arc::new(Mutex::new(ResultChannelState::default()));
+    (
+        ResultSender {
+            tx,
+            state: state.clone(),
+        },
+        ResultReceiver { rx, state },
+    )
+}
+
+/// Sending half of a stream's inbound queue.
 ///
-pub type ResultSender = mpsc::Sender<Result<GenMessage>>;
-pub type ResultReceiver = mpsc::Receiver<Result<GenMessage>>;
+/// The client connection reader uses [`ResultSender::try_send`] so a slow
+/// consumer cannot block unrelated streams. The server keeps its existing
+/// backpressure behavior through [`ResultSender::send`].
+#[derive(Clone, Debug)]
+pub struct ResultSender {
+    tx: mpsc::Sender<Result<GenMessage>>,
+    state: Arc<Mutex<ResultChannelState>>,
+}
+
+impl ResultSender {
+    /// Queues a result, waiting for capacity.
+    ///
+    /// This preserves the server's existing per-stream backpressure behavior.
+    pub async fn send(&self, res: Result<GenMessage>) -> Result<()> {
+        self.tx
+            .send(res)
+            .await
+            .map_err(|_| Error::Others(RECEIVER_GONE.to_string()))
+    }
+
+    /// Queues one client frame without waiting for the stream consumer.
+    ///
+    /// If the bounded mailbox is full, the frame is rejected and the overflow
+    /// reason becomes the stream's terminal error. The caller must unregister
+    /// the stream so the receiver observes that error after draining frames
+    /// already in the mailbox.
+    pub fn try_send(&self, msg: GenMessage) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(e) = state.terminal_error.as_ref() {
+            return Err(e.clone());
+        }
+
+        match self.tx.try_send(Ok(msg)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let e = Error::Others(QUEUE_OVERFLOW.to_string());
+                state.terminal_error = Some(e.clone());
+                Err(e)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(Error::Others(RECEIVER_GONE.to_string()))
+            }
+        }
+    }
+
+    /// Records the first terminal error for this stream.
+    ///
+    /// The error is kept outside the frame queue so socket, transform, and
+    /// protocol failures are not replaced merely because the queue is full.
+    pub fn fail(&self, e: Error) {
+        let mut state = self.state.lock().unwrap();
+        if state.terminal_error.is_none() {
+            state.terminal_error = Some(e);
+        }
+    }
+}
+
+/// Receiving half of a stream's inbound queue. See [`ResultSender`].
+#[derive(Debug)]
+pub struct ResultReceiver {
+    rx: mpsc::Receiver<Result<GenMessage>>,
+    state: Arc<Mutex<ResultChannelState>>,
+}
+
+impl ResultReceiver {
+    pub async fn recv(&mut self) -> Option<Result<GenMessage>> {
+        match self.rx.recv().await {
+            Some(res) => Some(res),
+            None => self.state.lock().unwrap().terminal_error.take().map(Err),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct SendingMessage {
@@ -687,5 +784,58 @@ impl StreamReceiver {
             }
         };
         Ok(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data_message(sequence: usize) -> GenMessage {
+        GenMessage::new_data(1, vec![sequence as u8])
+    }
+
+    #[tokio::test]
+    async fn result_channel_reports_overflow_after_buffered_frames() {
+        let (tx, mut rx) = result_channel();
+
+        for sequence in 0..MAX_QUEUED_FRAMES {
+            tx.try_send(data_message(sequence)).unwrap();
+        }
+
+        let overflow = tx
+            .try_send(data_message(MAX_QUEUED_FRAMES))
+            .unwrap_err();
+        assert_eq!(overflow, Error::Others(QUEUE_OVERFLOW.to_string()));
+        drop(tx);
+
+        for sequence in 0..MAX_QUEUED_FRAMES {
+            let msg = rx.recv().await.unwrap().unwrap();
+            assert_eq!(msg.payload, vec![sequence as u8]);
+        }
+
+        assert_eq!(rx.recv().await.unwrap().unwrap_err(), overflow);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn result_channel_preserves_the_first_terminal_error() {
+        let (tx, mut rx) = result_channel();
+
+        for sequence in 0..MAX_QUEUED_FRAMES {
+            tx.try_send(data_message(sequence)).unwrap();
+        }
+
+        let terminal = Error::Socket("connection lost".to_string());
+        tx.fail(terminal.clone());
+        assert_eq!(tx.try_send(data_message(0)).unwrap_err(), terminal);
+        drop(tx);
+
+        for _ in 0..MAX_QUEUED_FRAMES {
+            rx.recv().await.unwrap().unwrap();
+        }
+
+        assert_eq!(rx.recv().await.unwrap().unwrap_err(), terminal);
+        assert!(rx.recv().await.is_none());
     }
 }

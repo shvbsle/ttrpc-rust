@@ -26,7 +26,7 @@ use crate::proto::{
 use crate::r#async::connection::*;
 use crate::r#async::shutdown;
 use crate::r#async::stream::{
-    Kind, MessageReceiver, MessageSender, ResultReceiver, ResultSender, StreamInner,
+    result_channel, Kind, MessageReceiver, MessageSender, ResultSender, StreamInner,
 };
 
 use super::stream::SendingMessage;
@@ -200,7 +200,7 @@ impl Client {
         // sync client.
         check_oversize(msg.payload.len(), false)?;
 
-        let (tx, mut rx): (ResultSender, ResultReceiver) = mpsc::channel(100);
+        let (tx, mut rx) = result_channel();
         self.streams
             .lock()
             .map_err(|_| Error::Others("Failed to acquire lock on streams".to_string()))?
@@ -273,7 +273,7 @@ impl Client {
             msg.header.add_flags(FLAG_REMOTE_CLOSED);
         }
 
-        let (tx, rx): (ResultSender, ResultReceiver) = mpsc::channel(100);
+        let (tx, rx) = result_channel();
         self.streams
             .lock()
             .map_err(|_| Error::Others("Failed to acquire lock on streams".to_string()))?
@@ -349,11 +349,7 @@ impl WriterDelegate for ClientWriter {
 
         // TODO: if None
         if let Some(resp_tx) = resp_tx {
-            let e = Error::Socket(format!("{e:?}"));
-            resp_tx
-                .send(Err(e))
-                .await
-                .unwrap_or_else(|_e| error!("The request has returned"));
+            resp_tx.fail(Error::Socket(format!("{e:?}")));
         }
     }
 
@@ -362,56 +358,38 @@ impl WriterDelegate for ClientWriter {
     }
 }
 
-async fn get_resp_tx(
-    req_map: Arc<Mutex<HashMap<u32, ResultSender>>>,
+fn get_resp_tx(
+    req_map: &Mutex<HashMap<u32, ResultSender>>,
     header: &MessageHeader,
 ) -> Option<ResultSender> {
+    let mut req_map = req_map.lock().unwrap();
     let resp_tx = match header.type_ {
-        MESSAGE_TYPE_RESPONSE => match req_map.lock().unwrap().remove(&header.stream_id) {
-            Some(tx) => tx,
-            None => {
-                debug!("Receiver got unknown response packet {:?}", header);
-                return None;
-            }
-        },
+        MESSAGE_TYPE_RESPONSE => req_map.remove(&header.stream_id),
         MESSAGE_TYPE_DATA => {
             if (header.flags & FLAG_REMOTE_CLOSED) == FLAG_REMOTE_CLOSED {
-                match req_map.lock().unwrap().remove(&header.stream_id) {
-                    Some(tx) => tx,
-                    None => {
-                        debug!("Receiver got unknown data packet {:?}", header);
-                        return None;
-                    }
-                }
+                req_map.remove(&header.stream_id)
             } else {
-                match req_map.lock().unwrap().get(&header.stream_id) {
-                    Some(tx) => tx.clone(),
-                    None => {
-                        debug!("Receiver got unknown data packet {:?}", header);
-                        return None;
-                    }
-                }
+                req_map.get(&header.stream_id).cloned()
             }
         }
         _ => {
-            let resp_tx = match req_map.lock().unwrap().remove(&header.stream_id) {
-                Some(tx) => tx,
-                None => {
-                    debug!("Receiver got unknown packet {:?}", header);
-                    return None;
-                }
-            };
-            resp_tx
-                .send(Err(Error::Others(format!(
+            let resp_tx = req_map.remove(&header.stream_id);
+            drop(req_map);
+            if let Some(resp_tx) = resp_tx {
+                resp_tx.fail(Error::Others(format!(
                     "Receiver got malformed packet {header:?}"
-                ))))
-                .await
-                .unwrap_or_else(|_e| error!("The request has returned"));
+                )));
+            } else {
+                debug!("Receiver got unknown packet {:?}", header);
+            }
             return None;
         }
     };
 
-    Some(resp_tx)
+    if resp_tx.is_none() {
+        debug!("Receiver got unknown packet {:?}", header);
+    }
+    resp_tx
 }
 
 struct ClientReader {
@@ -436,45 +414,55 @@ impl ReaderDelegate for ClientReader {
         let mut map = std::mem::take(&mut *self.streams.lock().unwrap());
         // Terminate undone RPC requests with the error.
         for (_stream_id, resp_tx) in map.drain() {
-            if let Err(_e) = resp_tx.send(Err(e.clone())).await {
-                warn!("Failed to terminate pending RPC: the request has returned");
-            }
+            resp_tx.fail(e.clone());
         }
     }
 
     async fn exit(&self) {}
 
     async fn handle_err(&self, header: MessageHeader, e: Error) {
-        let req_map = self.streams.clone();
-        tokio::spawn(async move {
-            if let Some(resp_tx) = get_resp_tx(req_map, &header).await {
-                resp_tx
-                    .send(Err(e))
-                    .await
-                    .unwrap_or_else(|_e| error!("The request has returned"));
-            }
-        });
+        self.fail_stream(header.stream_id, e);
     }
 
     async fn handle_msg(&self, msg: GenMessage) {
-        let req_map = self.streams.clone();
-        let conn_ctx = self.conn_ctx.clone();
+        let stream_id = msg.header.stream_id;
 
         // ── Inbound transform in wire order ──
-        // Apply transform here (in the connection read loop) before spawning
-        // a handler task. This ensures deterministic nonce sequencing for
-        // stateful transforms (e.g., AEAD) regardless of task scheduling.
+        // Applied here, in the connection read loop, so that stateful
+        // transforms (e.g., AEAD) observe frames in deterministic nonce order.
         let mut msg = msg;
-        let result = conn_ctx.inbound(&mut msg, false);
+        if let Err(e) = self.conn_ctx.inbound(&mut msg, false) {
+            self.fail_stream(stream_id, e);
+            return;
+        }
 
-        tokio::spawn(async move {
-            if let Some(resp_tx) = get_resp_tx(req_map, &msg.header).await {
-                resp_tx
-                    .send(result.map(|_| msg))
-                    .await
-                    .unwrap_or_else(|_e| error!("The request has returned"));
+        if let Some(resp_tx) = get_resp_tx(&self.streams, &msg.header) {
+            if let Err(e) = resp_tx.try_send(msg) {
+                self.drop_stream(stream_id, e);
             }
-        });
+        }
+    }
+}
+
+impl ClientReader {
+    /// Forgets a stream whose inbound queue refused a frame, either because its
+    /// consumer is gone or because it overflowed its quota. Later frames for it
+    /// then take the cheap unknown-stream path instead of being reported again
+    /// one by one.
+    fn drop_stream(&self, stream_id: u32, e: Error) {
+        self.streams.lock().unwrap().remove(&stream_id);
+        debug!("Dropped stream {stream_id}: {e}");
+    }
+
+    /// Terminates and unregisters one stream without affecting other streams
+    /// sharing the connection.
+    fn fail_stream(&self, stream_id: u32, e: Error) {
+        if let Some(resp_tx) = self.streams.lock().unwrap().remove(&stream_id) {
+            resp_tx.fail(e.clone());
+            debug!("Failed stream {stream_id}: {e}");
+        } else {
+            debug!("Receiver got error for unknown stream {stream_id}: {e}");
+        }
     }
 }
 
