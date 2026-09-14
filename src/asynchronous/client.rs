@@ -15,19 +15,19 @@ use async_trait::async_trait;
 use tokio::{self, sync::mpsc, task};
 
 use crate::error::{get_rpc_status, Error, Result};
-use crate::ConnectionContext;
-#[cfg(feature = "security_extension")]
-use crate::security_extension::ConnectHook;
 use crate::proto::{
-    check_oversize, Codec, Code, GenMessage, Message, MessageHeader, Request, Response,
+    check_oversize, Code, Codec, GenMessage, Message, MessageHeader, Request, Response,
     ResponseInit, FLAG_NO_DATA, FLAG_REMOTE_CLOSED, FLAG_REMOTE_OPEN, MESSAGE_TYPE_DATA,
     MESSAGE_TYPE_RESPONSE,
 };
 use crate::r#async::connection::*;
 use crate::r#async::shutdown;
 use crate::r#async::stream::{
-    Kind, MessageReceiver, MessageSender, ResultReceiver, ResultSender, StreamInner,
+    result_mailbox, Kind, MessageReceiver, MessageSender, ResultSender, StreamInner,
 };
+#[cfg(feature = "security_extension")]
+use crate::security_extension::ConnectHook;
+use crate::ConnectionContext;
 
 use super::stream::SendingMessage;
 use super::transport::Socket;
@@ -84,8 +84,7 @@ impl Client {
     /// Panics if called outside a Tokio runtime because the client starts a background connection
     /// task.
     pub fn new(stream: Socket) -> Client {
-        Self::new_inner(stream, None)
-            .expect("new_inner without hook cannot fail")
+        Self::new_inner(stream, None).expect("new_inner without hook cannot fail")
     }
 
     /// Initialize a new [`Client`] with a connection hook.
@@ -200,14 +199,18 @@ impl Client {
         // sync client.
         check_oversize(msg.payload.len(), false)?;
 
-        let (tx, mut rx): (ResultSender, ResultReceiver) = mpsc::channel(100);
+        let (tx, mut rx) = result_mailbox();
         self.streams
             .lock()
             .map_err(|_| Error::Others("Failed to acquire lock on streams".to_string()))?
             .insert(stream_id, tx);
 
         // ── Injection Point 6/10: unary REQUEST transform_outbound ──
-        if let Err(e) = self.conn_ctx.transform_send(&mut msg, &self.req_tx, false, false).await {
+        if let Err(e) = self
+            .conn_ctx
+            .transform_send(&mut msg, &self.req_tx, false, false)
+            .await
+        {
             self.streams.lock().unwrap().remove(&stream_id);
             return Err(e);
         }
@@ -273,14 +276,18 @@ impl Client {
             msg.header.add_flags(FLAG_REMOTE_CLOSED);
         }
 
-        let (tx, rx): (ResultSender, ResultReceiver) = mpsc::channel(100);
+        let (tx, rx) = result_mailbox();
         self.streams
             .lock()
             .map_err(|_| Error::Others("Failed to acquire lock on streams".to_string()))?
             .insert(stream_id, tx);
 
         // ── Injection Point 8/10: stream-init REQUEST transform_outbound ──
-        if let Err(e) = self.conn_ctx.transform_send(&mut msg, &self.req_tx, false, false).await {
+        if let Err(e) = self
+            .conn_ctx
+            .transform_send(&mut msg, &self.req_tx, false, false)
+            .await
+        {
             self.streams.lock().unwrap().remove(&stream_id);
             return Err(e);
         }
@@ -341,56 +348,27 @@ impl WriterDelegate for ClientWriter {
     }
 }
 
-async fn get_resp_tx(
-    req_map: Arc<Mutex<HashMap<u32, ResultSender>>>,
+fn get_resp_tx(
+    req_map: &Mutex<HashMap<u32, ResultSender>>,
     header: &MessageHeader,
 ) -> Option<ResultSender> {
+    let mut req_map = req_map.lock().unwrap();
     let resp_tx = match header.type_ {
-        MESSAGE_TYPE_RESPONSE => match req_map.lock().unwrap().remove(&header.stream_id) {
-            Some(tx) => tx,
-            None => {
-                debug!("Receiver got unknown response packet {:?}", header);
-                return None;
-            }
-        },
+        MESSAGE_TYPE_RESPONSE => req_map.remove(&header.stream_id),
         MESSAGE_TYPE_DATA => {
             if (header.flags & FLAG_REMOTE_CLOSED) == FLAG_REMOTE_CLOSED {
-                match req_map.lock().unwrap().remove(&header.stream_id) {
-                    Some(tx) => tx,
-                    None => {
-                        debug!("Receiver got unknown data packet {:?}", header);
-                        return None;
-                    }
-                }
+                req_map.remove(&header.stream_id)
             } else {
-                match req_map.lock().unwrap().get(&header.stream_id) {
-                    Some(tx) => tx.clone(),
-                    None => {
-                        debug!("Receiver got unknown data packet {:?}", header);
-                        return None;
-                    }
-                }
+                req_map.get(&header.stream_id).cloned()
             }
         }
-        _ => {
-            let resp_tx = match req_map.lock().unwrap().remove(&header.stream_id) {
-                Some(tx) => tx,
-                None => {
-                    debug!("Receiver got unknown packet {:?}", header);
-                    return None;
-                }
-            };
-            resp_tx
-                .send(Err(Error::Others(format!(
-                    "Receiver got malformed packet {header:?}"
-                ))))
-                .await
-                .unwrap_or_else(|_e| error!("The request has returned"));
-            return None;
-        }
+        _ => None,
     };
 
-    Some(resp_tx)
+    if resp_tx.is_none() {
+        debug!("Receiver got unknown packet {:?}", header);
+    }
+    resp_tx
 }
 
 struct ClientReader {
@@ -413,14 +391,12 @@ impl ReaderDelegate for ClientReader {
 
         // Take all items out of `req_map`.
         let mut map = std::mem::take(&mut *self.streams.lock().unwrap());
-        // Terminate every pending RPC with the error. Use try_send so that one
-        // stream whose channel is full (a slow or stalled receiver) cannot block
-        // teardown of the others. If the channel is full the receiver already has
-        // messages queued and will observe RemoteClosed once we drop this sender
-        // here, so dropping the error is acceptable.
+        // Terminate every pending RPC with the error. Enqueuing into each
+        // per-RPC mailbox never waits for its consumer, so a slow or stalled
+        // stream cannot block teardown of the others.
         for (_stream_id, resp_tx) in map.drain() {
-            if resp_tx.try_send(Err(e.clone())).is_err() {
-                warn!("Failed to terminate pending RPC: stream channel full or closed");
+            if resp_tx.enqueue(Err(e.clone())).is_err() {
+                warn!("Failed to terminate pending RPC: the request has returned");
             }
         }
     }
@@ -428,36 +404,68 @@ impl ReaderDelegate for ClientReader {
     async fn exit(&self) {}
 
     async fn handle_err(&self, header: MessageHeader, e: Error) {
-        let req_map = self.streams.clone();
-        tokio::spawn(async move {
-            if let Some(resp_tx) = get_resp_tx(req_map, &header).await {
-                resp_tx
-                    .send(Err(e))
-                    .await
-                    .unwrap_or_else(|_e| error!("The request has returned"));
-            }
-        });
+        self.fail_stream(header.stream_id, e);
     }
 
     async fn handle_msg(&self, msg: GenMessage) {
-        let req_map = self.streams.clone();
-        let conn_ctx = self.conn_ctx.clone();
+        let stream_id = msg.header.stream_id;
 
         // ── Inbound transform in wire order ──
-        // Apply transform here (in the connection read loop) before spawning
-        // a handler task. This ensures deterministic nonce sequencing for
-        // stateful transforms (e.g., AEAD) regardless of task scheduling.
+        // Applied here, in the connection read loop, so that stateful
+        // transforms (e.g., AEAD) observe frames in deterministic nonce order.
         let mut msg = msg;
-        let result = conn_ctx.inbound(&mut msg, false);
+        if let Err(e) = self.conn_ctx.inbound(&mut msg, false) {
+            self.fail_stream(stream_id, e);
+            return;
+        }
 
-        tokio::spawn(async move {
-            if let Some(resp_tx) = get_resp_tx(req_map, &msg.header).await {
-                resp_tx
-                    .send(result.map(|_| msg))
-                    .await
-                    .unwrap_or_else(|_e| error!("The request has returned"));
-            }
-        });
+        if !matches!(msg.header.type_, MESSAGE_TYPE_RESPONSE | MESSAGE_TYPE_DATA) {
+            self.fail_stream(
+                stream_id,
+                Error::Others(format!("Receiver got malformed packet {:?}", msg.header)),
+            );
+            return;
+        }
+
+        if let Some(resp_tx) = get_resp_tx(&self.streams, &msg.header) {
+            self.dispatch_result(stream_id, resp_tx, Ok(msg));
+        }
+    }
+}
+
+impl ClientReader {
+    /// Appends a result to this RPC's ordered ingress mailbox.
+    ///
+    /// Unary responses, streaming data, terminal responses, close frames, and
+    /// errors all take this path. The per-RPC dispatcher forwards them to the
+    /// consumer without ever blocking the shared connection reader.
+    fn dispatch_result(
+        &self,
+        stream_id: u32,
+        resp_tx: ResultSender,
+        result: Result<GenMessage>,
+    ) {
+        if let Err(e) = resp_tx.enqueue(result) {
+            self.drop_stream(stream_id, e);
+        }
+    }
+
+    /// Forgets a stream whose consumer has gone away.
+    fn drop_stream(&self, stream_id: u32, e: Error) {
+        self.streams.lock().unwrap().remove(&stream_id);
+        debug!("Dropped stream {stream_id}: {e}");
+    }
+
+    /// Terminates and unregisters one stream without affecting other streams
+    /// sharing the connection.
+    fn fail_stream(&self, stream_id: u32, e: Error) {
+        let resp_tx = self.streams.lock().unwrap().remove(&stream_id);
+        if let Some(resp_tx) = resp_tx {
+            self.dispatch_result(stream_id, resp_tx, Err(e.clone()));
+            debug!("Failed stream {stream_id}: {e}");
+        } else {
+            debug!("Receiver got error for unknown stream {stream_id}: {e}");
+        }
     }
 }
 
@@ -570,21 +578,24 @@ mod teardown_tests {
         );
     }
 
-    // ClientReader::disconnect must fail every registered stream without blocking
-    // on a stream whose channel is full (a slow or stalled receiver).
+    // ClientReader::disconnect must fail every registered stream without
+    // blocking on a slow or stalled receiver.
     #[tokio::test]
-    async fn disconnect_does_not_block_on_full_stream_channel() {
+    async fn disconnect_does_not_block_on_stalled_stream() {
         let streams: Arc<Mutex<HashMap<u32, ResultSender>>> = Arc::new(Mutex::new(HashMap::new()));
 
-        // Stream 1: channel filled to capacity, its receiver kept but never read.
-        let (full_tx, _full_rx): (ResultSender, ResultReceiver) = mpsc::channel(1);
-        full_tx
-            .try_send(Err(Error::Others("prefill".to_string())))
-            .expect("prefill should occupy the single slot");
+        // Stream 1: more than the bounded consumer channel's capacity is
+        // already queued, and its receiver is deliberately never read.
+        let (full_tx, _full_rx) = result_mailbox();
+        for _ in 0..200 {
+            full_tx
+                .enqueue(Err(Error::Others("prefill".to_string())))
+                .expect("mailbox enqueue must not wait for its consumer");
+        }
         streams.lock().unwrap().insert(1, full_tx);
 
-        // Stream 2: normal channel with spare capacity.
-        let (tx2, mut rx2): (ResultSender, ResultReceiver) = mpsc::channel(1);
+        // Stream 2: normal mailbox whose consumer is waiting.
+        let (tx2, mut rx2) = result_mailbox();
         streams.lock().unwrap().insert(2, tx2);
 
         let (_notifier, waiter) = shutdown::new();
@@ -601,9 +612,9 @@ mod teardown_tests {
             reader.disconnect(Error::Socket("boom".to_string()), &mut dummy_task),
         )
         .await
-        .expect("disconnect must not block on a full stream channel");
+        .expect("disconnect must not block on a stalled stream");
 
-        // The non-full stream received the terminal error.
+        // The active stream received the terminal error.
         let got = rx2.recv().await.expect("stream 2 should receive a message");
         assert!(got.is_err(), "stream 2 should be terminated with an error");
 

@@ -16,17 +16,127 @@ use tokio::sync::mpsc;
 use super::Client;
 use crate::error::{Error, Result};
 use crate::proto::{
-    check_oversize, Code, Codec, GenMessage, Response, FLAG_NO_DATA,
-    FLAG_REMOTE_CLOSED, MESSAGE_TYPE_DATA, MESSAGE_TYPE_RESPONSE,
+    check_oversize, Code, Codec, GenMessage, Response, FLAG_NO_DATA, FLAG_REMOTE_CLOSED,
+    MESSAGE_TYPE_DATA, MESSAGE_TYPE_RESPONSE,
 };
 
 pub type MessageSender = mpsc::Sender<SendingMessage>;
 pub type MessageReceiver = mpsc::Receiver<SendingMessage>;
 
-/// Internal message type for stream channels.
+const RESULT_CHANNEL_CAPACITY: usize = 100;
+const RESULT_CHANNEL_FULL: &str = "the response channel is full";
+const RECEIVER_GONE: &str = "the stream receiver is gone";
+
+#[derive(Clone, Debug)]
+enum ResultSenderInner {
+    Direct(mpsc::Sender<Result<GenMessage>>),
+    Mailbox(mpsc::UnboundedSender<Result<GenMessage>>),
+}
+
+/// Sending half of an internal response channel.
+#[derive(Clone, Debug)]
+pub struct ResultSender {
+    inner: ResultSenderInner,
+}
+
+/// Receiving half of an internal response channel.
+#[derive(Debug)]
+pub struct ResultReceiver {
+    rx: mpsc::Receiver<Result<GenMessage>>,
+}
+
+/// Creates a bounded response channel with ordinary awaited backpressure.
 ///
-pub type ResultSender = mpsc::Sender<Result<GenMessage>>;
-pub type ResultReceiver = mpsc::Receiver<Result<GenMessage>>;
+/// The server uses this path.
+pub fn result_channel() -> (ResultSender, ResultReceiver) {
+    let (tx, rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
+    (
+        ResultSender {
+            inner: ResultSenderInner::Direct(tx),
+        },
+        ResultReceiver { rx },
+    )
+}
+
+/// Creates an ordered mailbox for one async-client stream ID.
+///
+/// Unary and streaming RPCs both have a stream ID and both use this path. The
+/// connection reader appends results to an unbounded ingress FIFO without
+/// waiting. One dispatcher task per RPC forwards those results, in order, to
+/// the existing bounded consumer channel. A slow consumer can therefore block
+/// only its own dispatcher, never the shared connection reader.
+///
+/// ttrpc has no per-stream receive-window protocol, so avoiding both
+/// connection-wide backpressure and arbitrary stream failure requires the
+/// ingress queue to absorb frames already sent by the peer. This replaces the
+/// previous unbounded task-per-frame behavior with one FIFO and one task per
+/// active RPC.
+pub fn result_mailbox() -> (ResultSender, ResultReceiver) {
+    let (mailbox_tx, mut mailbox_rx) = mpsc::unbounded_channel();
+    let (consumer_tx, consumer_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
+
+    tokio::spawn(async move {
+        loop {
+            let result = tokio::select! {
+                _ = consumer_tx.closed() => break,
+                result = mailbox_rx.recv() => match result {
+                    Some(result) => result,
+                    None => break,
+                },
+            };
+
+            if consumer_tx.send(result).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    (
+        ResultSender {
+            inner: ResultSenderInner::Mailbox(mailbox_tx),
+        },
+        ResultReceiver { rx: consumer_rx },
+    )
+}
+
+impl ResultSender {
+    /// Queues a result with awaited backpressure when this is a direct channel.
+    pub async fn send(&self, res: Result<GenMessage>) -> Result<()> {
+        match &self.inner {
+            ResultSenderInner::Direct(tx) => tx
+                .send(res)
+                .await
+                .map_err(|_| Error::Others(RECEIVER_GONE.to_string())),
+            ResultSenderInner::Mailbox(tx) => tx
+                .send(res)
+                .map_err(|_| Error::Others(RECEIVER_GONE.to_string())),
+        }
+    }
+
+    /// Enqueues a client result without waiting for its consumer.
+    pub fn enqueue(&self, res: Result<GenMessage>) -> Result<()> {
+        match &self.inner {
+            ResultSenderInner::Mailbox(tx) => tx
+                .send(res)
+                .map_err(|_| Error::Others(RECEIVER_GONE.to_string())),
+            ResultSenderInner::Direct(tx) => match tx.try_send(res) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    Err(Error::Others(RESULT_CHANNEL_FULL.to_string()))
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(Error::Others(RECEIVER_GONE.to_string()))
+                }
+            },
+        }
+    }
+}
+
+impl ResultReceiver {
+    pub async fn recv(&mut self) -> Option<Result<GenMessage>> {
+        self.rx.recv().await
+    }
+}
 
 #[derive(Debug)]
 pub struct SendingMessage {
@@ -600,7 +710,9 @@ impl StreamSender {
 
         let mut msg = GenMessage::new_data(self.stream_id, buf);
         // ── Injection Point 9/10: streaming DATA transform_outbound ──
-        self.conn_ctx.transform_send(&mut msg, &self.tx, false, true).await?;
+        self.conn_ctx
+            .transform_send(&mut msg, &self.tx, false, true)
+            .await?;
 
         Ok(())
     }
@@ -618,7 +730,9 @@ impl StreamSender {
             return Err(Error::LocalClosed);
         }
         let mut msg = GenMessage::new_close(self.stream_id);
-        self.conn_ctx.transform_send(&mut msg, &self.tx, false, true).await?;
+        self.conn_ctx
+            .transform_send(&mut msg, &self.tx, false, true)
+            .await?;
         self.local_closed.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -687,5 +801,53 @@ impl StreamReceiver {
             }
         };
         Ok(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data_message(sequence: usize) -> GenMessage {
+        GenMessage::new_data(1, vec![sequence as u8])
+    }
+
+    #[tokio::test]
+    async fn result_mailbox_buffers_burst_in_order() {
+        let (tx, mut rx) = result_mailbox();
+        let frame_count = RESULT_CHANNEL_CAPACITY * 2;
+
+        for sequence in 0..frame_count {
+            tx.enqueue(Ok(data_message(sequence))).unwrap();
+        }
+        drop(tx);
+
+        for sequence in 0..frame_count {
+            let msg = rx.recv().await.unwrap().unwrap();
+            assert_eq!(msg.payload, vec![sequence as u8]);
+        }
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn result_mailbox_delivers_terminal_error_after_buffered_frames() {
+        let (tx, mut rx) = result_mailbox();
+        let frame_count = RESULT_CHANNEL_CAPACITY * 2;
+
+        for sequence in 0..frame_count {
+            tx.enqueue(Ok(data_message(sequence))).unwrap();
+        }
+
+        let terminal = Error::Socket("connection lost".to_string());
+        tx.enqueue(Err(terminal.clone())).unwrap();
+        drop(tx);
+
+        for sequence in 0..frame_count {
+            let msg = rx.recv().await.unwrap().unwrap();
+            assert_eq!(msg.payload, vec![sequence as u8]);
+        }
+
+        assert_eq!(rx.recv().await.unwrap().unwrap_err(), terminal);
+        assert!(rx.recv().await.is_none());
     }
 }
